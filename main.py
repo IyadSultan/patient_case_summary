@@ -46,9 +46,16 @@ class ConditionInfo(BaseModel):
     code: str
     display: str
     clinical_status: str
-    stage: Optional[str] = None
     bodySite: Optional[str] = None
     histology: Optional[str] = None
+    stage: Optional[str] = None
+
+    # Additional fields
+    stage_grouping: Optional[str] = None
+    assessment: Optional[str] = None
+    tumor_size: Optional[str] = None
+    tumor_marker_results: List[str] = Field(default_factory=list)
+
 
 class EncounterInfo(BaseModel):
     """Information about a medical encounter."""
@@ -67,6 +74,9 @@ class PatientInfo(BaseModel):
     given_name: str = Field(default="Not Provided")
     family_name: str = Field(default="Not Provided")
     birth_date: Optional[str] = Field(default="Not Provided")
+    age_at_diagnosis: Optional[int] = Field(default=None)
+    age: Optional[int] = Field(default=None)
+    months_since_diagnosis: Optional[int] = Field(default=None)
     gender: str
     conditions: List[ConditionInfo] = Field(default_factory=list)
     recent_encounters: List[EncounterInfo] = Field(default_factory=list, description="A few recent encounters.")
@@ -78,7 +88,7 @@ class PatientInfo(BaseModel):
         return f"""\
 Given name: {self.given_name}
 Family name: {self.family_name}
-Birth date: {self.birth_date}
+age: {self.age}
 Gender: {self.gender}"""
 
 class ConditionBundle(BaseModel):
@@ -229,8 +239,7 @@ Given the above data, produce a `CaseSummary` as per the schema.
 #####################################
 
 def parse_synthea_patient(file_path: str, filter_active: bool = True) -> PatientInfo:
-    """Parse a Synthea-generated patient JSON file into a PatientInfo object."""
-    # Load the Synthea-generated FHIR Bundle
+    """Parse a Synthea-generated (or mCODE-like) patient JSON file into a PatientInfo object."""
     with open(file_path, "r") as f:
         bundle = json.load(f)
 
@@ -238,8 +247,9 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
     conditions = []
     encounters = []
     medication_requests = []
+    observations = []
 
-    # Extract resources by type
+    # Separate resources by type
     for entry in bundle.get("entry", []):
         resource = entry.get("resource", {})
         resource_type = resource.get("resourceType")
@@ -252,88 +262,110 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
             encounters.append(resource)
         elif resource_type == "MedicationRequest":
             medication_requests.append(resource)
+        elif resource_type == "Observation":
+            observations.append(resource)
 
+    # ---------------------
+    # 1) Patient Info
+    # ---------------------
     if not patient_resource:
         raise ValueError("No Patient resource found in the provided file.")
 
-    # Extract patient demographics with safer handling of missing/null values
     name_entry = patient_resource.get("name", [{}])[0]
-    given_name = name_entry.get("given", ["Not Provided"])[0]
+    # If no 'given' or 'family' is present, handle gracefully
+    given_name = name_entry.get("given", ["Not Provided"])[0] if "given" in name_entry else "Not Provided"
     family_name = name_entry.get("family", "Not Provided")
-    birth_date = patient_resource.get("birthDate") or "Not Provided"
+    birth_date = patient_resource.get("birthDate", "Not Provided")
     gender = patient_resource.get("gender", "Not Provided")
 
-    # Define excluded conditions
-    excluded_conditions = {"Medication review due (situation)", "Risk activity involvement (finding)"}
-    
-    # Process conditions
+    # ---------------------
+    # 2) Conditions
+    # ---------------------
     condition_info_list = []
     for c in conditions:
         code_info = c.get("code", {}).get("coding", [{}])[0]
         condition_code = code_info.get("code", "Unknown")
         condition_display = code_info.get("display", "Unknown")
+
         clinical_status = (
             c.get("clinicalStatus", {})
              .get("coding", [{}])[0]
              .get("code", "unknown")
         )
-        
-        # Extract melanoma-specific information
-        stage = None
-        if c.get("stage"):
-            stage_info = c.get("stage", [{}])[0].get("summary", {}).get("coding", [{}])[0]
-            stage = stage_info.get("display") if stage_info else None
 
+        # Body site
         body_site = None
         if c.get("bodySite"):
-            site_info = c.get("bodySite", [{}])[0].get("coding", [{}])[0]
-            body_site = site_info.get("display") if site_info else None
+            site_info = c["bodySite"][0].get("coding", [{}])[0]
+            body_site = site_info.get("display")
 
+        # Stage & Stage Grouping
+        stage = None
+        stage_grouping = None
+        assessment = None
+
+        # mCODE's `stage` array can contain `summary`, `type`, `assessment`
+        if "stage" in c and c["stage"]:
+            stage_entry = c["stage"][0]  # typically an array
+            # stage summary
+            stage_summary_coding = stage_entry.get("summary", {}).get("coding", [{}])[0]
+            stage = stage_summary_coding.get("display")
+
+            # stage grouping (e.g., T2, T3, etc.)
+            type_coding = stage_entry.get("type", {}).get("coding", [{}])[0]
+            stage_grouping = type_coding.get("display")
+
+            # assessment (e.g., "pT2aNx")
+            assessment_coding = stage_entry.get("assessment", {}).get("coding", [{}])[0]
+            assessment = assessment_coding.get("display")
+
+        # Histology (extension)
         histology = None
         for ext in c.get("extension", []):
             if ext.get("url", "").endswith("mcode-histology-morphology-behavior"):
                 hist_info = ext.get("valueCodeableConcept", {}).get("coding", [{}])[0]
-                histology = hist_info.get("display") if hist_info else None
+                histology = hist_info.get("display")
 
-        # Check exclusion and active filters
+        # Filter out inactive conditions if filter_active is True
         if filter_active:
             if clinical_status == "active":
-                condition_info_list.append(
-                    ConditionInfo(
-                        code=condition_code,
-                        display=condition_display,
-                        clinical_status=clinical_status,
-                        stage=stage,
-                        bodySite=body_site,
-                        histology=histology
-                    )
-                )
-        else:
-            condition_info_list.append(
-                ConditionInfo(
+                cond_obj = ConditionInfo(
                     code=condition_code,
                     display=condition_display,
                     clinical_status=clinical_status,
                     stage=stage,
                     bodySite=body_site,
-                    histology=histology
+                    histology=histology,
+                    stage_grouping=stage_grouping,
+                    assessment=assessment
                 )
+                condition_info_list.append(cond_obj)
+        else:
+            cond_obj = ConditionInfo(
+                code=condition_code,
+                display=condition_display,
+                clinical_status=clinical_status,
+                stage=stage,
+                bodySite=body_site,
+                histology=histology,
+                stage_grouping=stage_grouping,
+                assessment=assessment
             )
+            condition_info_list.append(cond_obj)
 
-    # Parse encounters
+    # ---------------------
+    # 3) Encounters
+    # ---------------------
     def get_encounter_date(enc):
         period = enc.get("period", {})
         start = period.get("start")
         if not start:
             return datetime.min
-        
-        # Handle various date formats
         try:
             if 'T' in start:
-                clean_date = start.split('.')[0].split('+')[0].split('-')[0]
-                return datetime.strptime(clean_date, "%Y-%m-%dT%H:%M:%S")
+                return datetime.strptime(start.split('.')[0], "%Y-%m-%dT%H:%M:%S")
             else:
-                return datetime.strptime(start, "%Y")
+                return datetime.strptime(start, "%Y-%m-%d")
         except ValueError:
             return datetime.min
 
@@ -344,10 +376,13 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
     for e in recent_encounters:
         period = e.get("period", {})
         start_date = period.get("start", "")
-        if start_date:
-            start_date = start_date.split('+')[0].split('-')[0]
-        reason = e.get("reasonCode", [{}])[0].get("coding", [{}])[0].get("display", None)
-        etype = e.get("type", [{}])[0].get("coding", [{}])[0].get("display", None)
+        reason = None
+        etype = None
+        if "reasonCode" in e and e["reasonCode"]:
+            reason = e["reasonCode"][0].get("coding", [{}])[0].get("display")
+        if "type" in e and e["type"]:
+            etype = e["type"][0].get("coding", [{}])[0].get("display")
+
         encounter_info_list.append(
             EncounterInfo(
                 date=start_date,
@@ -356,7 +391,9 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
             )
         )
 
-    # Parse medications
+    # ---------------------
+    # 4) Medications
+    # ---------------------
     medication_info_list = []
     for m in medication_requests:
         status = m.get("status")
@@ -365,8 +402,9 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
             med_name = med_code.get("display", "Unknown Medication")
             authored = m.get("authoredOn", None)
             if authored:
-                authored = authored.split('+')[0].split('-')[0]
+                authored = authored.split('T')[0]
             dosage_instruction = m.get("dosageInstruction", [{}])[0].get("text", None)
+
             medication_info_list.append(
                 MedicationInfo(
                     name=med_name,
@@ -375,7 +413,40 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
                 )
             )
 
-    # Create final PatientInfo object
+    # ---------------------
+    # 5) Observations (Tumor Marker, Size, etc.)
+    # ---------------------
+    # You can link each observation to a condition if needed, or store them globally
+    # in the 'PatientInfo' or create a separate class. Here we just parse them in place.
+    for obs in observations:
+        code_obj = obs.get("code", {}).get("coding", [{}])[0]
+        obs_code = code_obj.get("code")
+        obs_display = code_obj.get("display", "")
+        obs_value_cc = obs.get("valueCodeableConcept", {}).get("coding", [{}])[0]
+        obs_value_display = obs_value_cc.get("display", "")
+        
+        # Example: if "tumor size" or "tumor marker test" is recognized by LOINC or SNOMED code
+        # Collect them to attach to relevant ConditionInfo objects (if known)
+        # For demonstration, let's check for "PET/CT" or other tests:
+        if "PET/CT" in obs_display:
+            # Suppose we want to store this marker in all 'melanoma' conditions
+            for cond_obj in condition_info_list:
+                if "melanoma" in cond_obj.display.lower():
+                    cond_obj.tumor_marker_results.append(obs_value_display)
+
+        # If your Observations have numeric tumor size under `valueQuantity`, you can parse it:
+        if "valueQuantity" in obs:
+            quantity_val = obs["valueQuantity"].get("value")
+            quantity_unit = obs["valueQuantity"].get("unit", "")
+            # Attach to relevant condition, or keep a general reference
+            for cond_obj in condition_info_list:
+                # example check if condition code is for a primary tumor
+                if "melanoma" in cond_obj.display.lower():
+                    cond_obj.tumor_size = f"{quantity_val} {quantity_unit}"
+
+    # ---------------------
+    # 6) Final Assembly
+    # ---------------------
     patient_info = PatientInfo(
         given_name=given_name,
         family_name=family_name,
@@ -383,10 +454,11 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
         gender=gender,
         conditions=condition_info_list,
         recent_encounters=encounter_info_list,
-        current_medications=medication_info_list
+        current_medications=medication_info_list,
     )
 
     return patient_info
+
 
 async def create_condition_bundles(
     patient_data: PatientInfo, 
