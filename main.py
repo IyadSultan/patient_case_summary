@@ -46,6 +46,9 @@ class ConditionInfo(BaseModel):
     code: str
     display: str
     clinical_status: str
+    stage: Optional[str] = None
+    bodySite: Optional[str] = None
+    histology: Optional[str] = None
 
 class EncounterInfo(BaseModel):
     """Information about a medical encounter."""
@@ -61,9 +64,9 @@ class MedicationInfo(BaseModel):
 
 class PatientInfo(BaseModel):
     """Comprehensive patient information including demographics and medical history."""
-    given_name: str
-    family_name: str
-    birth_date: str
+    given_name: str = Field(default="Not Provided")
+    family_name: str = Field(default="Not Provided")
+    birth_date: Optional[str] = Field(default="Not Provided")
     gender: str
     conditions: List[ConditionInfo] = Field(default_factory=list)
     recent_encounters: List[EncounterInfo] = Field(default_factory=list, description="A few recent encounters.")
@@ -141,42 +144,35 @@ class CaseSummary(BaseModel):
 #####################################
 
 CONDITION_BUNDLE_PROMPT = """\
-You are an assistant that takes a patient's summarized clinical data and associates each active condition with any relevant recent encounters and current medications.
+You are an assistant that takes a patient's melanoma clinical data and associates the condition with relevant encounters and medications.
 
 **Steps to follow:**
-1. Review the patient's demographics, conditions, recent encounters, and current medications.
-2. For each condition in 'conditions':
-   - Determine which of the 'recent_encounters' are relevant. An encounter is relevant if:
-     - The 'reason_display' or 'type_display' of the encounter mentions or is closely related to the condition.
-     - Consider synonyms or partial matches. For example, for "Childhood asthma (disorder)", any encounter mentioning "asthma" or "asthma follow-up" is relevant.
-   - Determine which of the 'current_medications' are relevant. A medication is relevant if:
-     - The medication 'name' or 'instructions' are clearly related to managing that condition. For example, inhalers or corticosteroids for asthma, topical creams for dermatitis.
-     - Consider partial matches. For "Atopic dermatitis (disorder)", a medication used for allergic conditions or skin inflammations could be relevant.
-3. Ignore patient demographics for relevance determination; they are just context.
-4. Return the final output strictly as a JSON object following the schema (provided as a tool call). 
-   Do not include extra commentary outside the JSON.
+1. Review the patient's demographics, melanoma condition details, recent encounters, and current medications.
+2. For the melanoma condition:
+   - Determine which encounters are relevant to melanoma diagnosis, treatment, or follow-up
+   - Determine which medications are related to melanoma treatment (e.g., immunotherapy, targeted therapy)
+   - Consider the stage, body site, and histology of the melanoma when determining relevance
+3. Return the final output strictly as a JSON object following the schema.
 
 **Patient Data**:
 {patient_info}
 """
 
 GUIDELINE_QUERIES_PROMPT = """\
-You are an assistant tasked with determining what guidelines would be most helpful to consult for a given patient's condition data. You have:
-
-- Patient information (demographics, conditions, encounters, medications)
-- A single condition bundle that includes:
-  - One specific condition and its related encounters and medications
-- Your goal is to produce several high-quality search queries that can be used to retrieve relevant guideline sections from a vector index of medical guidelines.
+You are an assistant tasked with determining what melanoma guidelines would be most helpful for this patient's case.
 
 **Instructions:**
-1. Review the patient info and the condition bundle. Identify the key aspects of the condition that might require guideline consultation—such as disease severity, typical management steps, trigger avoidance, or medication optimization.
+1. Review the patient's melanoma details including:
+   - Stage of disease
+   - Body site affected
+   - Histological type
+   - Current treatments
 2. Consider what clinicians would look up:
-   - Best practices for this condition's management
-   - Medication recommendations
-   - Encounter follow-ups
-   - Patient education and preventive measures
-3. Formulate 3-5 concise, targeted queries
-4. Make the queries condition-specific, incorporating relevant medications or encounter findings. 
+   - Staging-specific treatment recommendations
+   - Surgical margins based on melanoma type and location
+   - Appropriate systemic therapy options
+   - Follow-up and monitoring guidelines
+3. Formulate 3-5 specific queries focused on melanoma management
 
 Patient Info: {patient_info}
 
@@ -260,12 +256,12 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
     if not patient_resource:
         raise ValueError("No Patient resource found in the provided file.")
 
-    # Extract patient demographics
+    # Extract patient demographics with safer handling of missing/null values
     name_entry = patient_resource.get("name", [{}])[0]
-    given_name = name_entry.get("given", [""])[0]
-    family_name = name_entry.get("family", "")
-    birth_date = patient_resource.get("birthDate", "")
-    gender = patient_resource.get("gender", "")
+    given_name = name_entry.get("given", ["Not Provided"])[0]
+    family_name = name_entry.get("family", "Not Provided")
+    birth_date = patient_resource.get("birthDate") or "Not Provided"
+    gender = patient_resource.get("gender", "Not Provided")
 
     # Define excluded conditions
     excluded_conditions = {"Medication review due (situation)", "Risk activity involvement (finding)"}
@@ -282,25 +278,47 @@ def parse_synthea_patient(file_path: str, filter_active: bool = True) -> Patient
              .get("code", "unknown")
         )
         
+        # Extract melanoma-specific information
+        stage = None
+        if c.get("stage"):
+            stage_info = c.get("stage", [{}])[0].get("summary", {}).get("coding", [{}])[0]
+            stage = stage_info.get("display") if stage_info else None
+
+        body_site = None
+        if c.get("bodySite"):
+            site_info = c.get("bodySite", [{}])[0].get("coding", [{}])[0]
+            body_site = site_info.get("display") if site_info else None
+
+        histology = None
+        for ext in c.get("extension", []):
+            if ext.get("url", "").endswith("mcode-histology-morphology-behavior"):
+                hist_info = ext.get("valueCodeableConcept", {}).get("coding", [{}])[0]
+                histology = hist_info.get("display") if hist_info else None
+
         # Check exclusion and active filters
-        if condition_display not in excluded_conditions:
-            if filter_active:
-                if clinical_status == "active":
-                    condition_info_list.append(
-                        ConditionInfo(
-                            code=condition_code,
-                            display=condition_display,
-                            clinical_status=clinical_status
-                        )
-                    )
-            else:
+        if filter_active:
+            if clinical_status == "active":
                 condition_info_list.append(
                     ConditionInfo(
                         code=condition_code,
                         display=condition_display,
-                        clinical_status=clinical_status
+                        clinical_status=clinical_status,
+                        stage=stage,
+                        bodySite=body_site,
+                        histology=histology
                     )
                 )
+        else:
+            condition_info_list.append(
+                ConditionInfo(
+                    code=condition_code,
+                    display=condition_display,
+                    clinical_status=clinical_status,
+                    stage=stage,
+                    bodySite=body_site,
+                    histology=histology
+                )
+            )
 
     # Parse encounters
     def get_encounter_date(enc):
@@ -471,7 +489,8 @@ class GuidelineRecommendationWorkflow(Workflow):
         if patient_info_path.exists():
             if self._verbose:
                 ctx.write_event_to_stream(LogEvent(msg=">> Loading patient info from cache"))
-            patient_info_dict = json.load(open(str(patient_info_path), "r"))
+            with open(str(patient_info_path), "r", encoding='utf-8') as f:
+                patient_info_dict = json.load(f)
             patient_info = PatientInfo.model_validate(patient_info_dict)
         else:
             if self._verbose:
@@ -480,7 +499,7 @@ class GuidelineRecommendationWorkflow(Workflow):
             
             if not isinstance(patient_info, PatientInfo):
                 raise ValueError(f"Invalid patient info: {patient_info}")
-            with open(patient_info_path, "w") as fp:
+            with open(patient_info_path, "w", encoding='utf-8') as fp:
                 fp.write(patient_info.model_dump_json())
         if self._verbose:
             ctx.write_event_to_stream(LogEvent(msg=f">> Patient Info: {patient_info.dict()}"))
@@ -497,12 +516,13 @@ class GuidelineRecommendationWorkflow(Workflow):
             f"{self.output_dir}/condition_bundles.json"
         )
         if condition_info_path.exists():
-            condition_bundles = ConditionBundles.model_validate(
-                json.load(open(str(condition_info_path), "r"))
-            )
+            with open(str(condition_info_path), "r", encoding='utf-8') as f:
+                condition_bundles = ConditionBundles.model_validate(
+                    json.load(f)
+                )
         else:
             condition_bundles = await create_condition_bundles(ev.patient_info)
-            with open(condition_info_path, "w") as fp:
+            with open(condition_info_path, "w", encoding='utf-8') as fp:
                 fp.write(condition_bundles.model_dump_json())
             
         return ConditionBundleEvent(bundles=condition_bundles)
@@ -582,9 +602,9 @@ class GuidelineRecommendationWorkflow(Workflow):
             return
 
         match_results = [(e.bundle, e.rec) for e in events]
-        # Save match results
+        # Save match results with UTF-8 encoding
         recs_path = Path(f"{self.output_dir}/guideline_recommendations.jsonl")
-        with open(recs_path, "w") as fp:
+        with open(recs_path, "w", encoding='utf-8') as fp:
             for _, rec in match_results:
                 fp.write(rec.model_dump_json() + "\n")
                 
@@ -627,7 +647,7 @@ class GuidelineRecommendationWorkflow(Workflow):
 
 async def main():
     # Initialize workflow components
-    documents = SimpleDirectoryReader('guidelines/').load_data()
+    documents = SimpleDirectoryReader('guidelines').load_data()
     local_index = VectorStoreIndex.from_documents(documents)
     retriever = local_index.as_retriever(similarity_top_k=3)
 
@@ -640,7 +660,7 @@ async def main():
     )
 
     # Run workflow
-    handler = workflow.run(patient_json_path="data/almeta_buckridge.json")
+    handler = workflow.run(patient_json_path="data/melanoma.json")
     
     # Process events
     async for event in handler.stream_events():
